@@ -1,4 +1,5 @@
-# build-3d-m-creation
+# build-3d-m-creation 
+# also research on fine tune any model for 3D
 - Text-to-3D Model Generation
 - Single-Image-to-3D Model Generation
 - Multi-View-Image-to-3D Model Generation
