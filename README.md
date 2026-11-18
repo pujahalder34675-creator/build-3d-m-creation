@@ -1,1 +1,195 @@
 # build-3d-m-creation
+- Text-to-3D Model Generation
+- Single-Image-to-3D Model Generation
+- Multi-View-Image-to-3D Model Generation
+- Sketch-to-3D Model Generation
+- Batch Image-to-3D Generation
+- Text-to-Image Generation
+- Image-to-Image Generation
+- Reference Image Preparation
+- Image Background Removal and Object Cutout
+- Image Element Extraction
+- Front, Back, Left, and Right Reference-View Generation
+- One-Click Textured Model Generation
+- Build-and-Refine Geometry-First Workflow
+- Generate Models in Pre-Segmented Parts
+- H-Series High-Detail Model Generation (Up to 2 Million Polygons)
+- P-Series Smart Mesh Generation
+- Native Quad-Mesh Topology
+- Triangle-Mesh Topology
+- Custom Polygon Count and Face-Limit Control
+- Multiple Generation Variations
+- Smart Low-Poly Mesh Generation
+- Mesh Retopology
+- Mesh Decimation
+- Triangle-to-Quad Mesh Conversion
+- Selected-Part Retopology
+- Local Geometry Regeneration
+- Symmetry-Preserving Mesh Conversion
+- Mesh Bottom Flattening
+- AI Semantic Mesh Segmentation
+- Simple, Balanced, and Detailed Segmentation Modes
+- Brush-Based Segment Refinement
+- Add, Merge, and Delete Model Parts
+- Part Renaming and Visibility Controls
+- Independent Part Translation, Rotation, and Scaling
+- Quick Cap for Open Mesh Parts
+- AI Part Completion and Surface Filling
+- Individual Model-Part Export
+- Text-Prompt AI Texturing
+- Image-Reference AI Texturing
+- AI Retexturing of Existing Models
+- Local Texture Magic Brush
+- Texture Creativity-Strength Control
+- Texture Resolution Upscaling to 4K/8K
+- PBR Material Generation
+- Base-Color/Albedo Map Generation
+- Normal Map Generation
+- Roughness Map Generation
+- Metallic Map Generation
+- Baked Lighting Removal
+- Material Metallic and Roughness Adjustment
+- Smart UV Unwrapping
+- Automatic UV Seam Generation
+- UV Atlas Inspection
+- UV Regeneration
+- Automatic Skeleton Rigging
+- Automatic Skin-Weight Assignment
+- Humanoid/Biped Rigging
+- Quadruped Rigging
+- Hexapod Rigging
+- Octopod Rigging
+- Avian Rigging
+- Serpentine Rigging
+- Aquatic/Fish Rigging
+- Rig Compatibility Precheck
+- Mixamo-Compatible Skeleton Preset
+- ActorCore-Compatible Skeleton Preset
+- Unity Humanoid Skeleton Preset
+- Unreal Engine Mannequin Skeleton Preset
+- VRM Humanoid Skeleton Preset
+- Rig Joint-Rotation Preview
+- Built-In Character Animation Presets
+- Text-to-Motion Animation Generation
+- Motion Retargeting
+- 3D Animation Preview
+- Rigged and Animated Model Export
+- Interactive 3D Model Viewer
+- Wireframe Model View
+- Solid-Shaded Model View
+- Textured Model View
+- Hologram Mesh Inspection Shader
+- 3D Ground-Plane/Grid Display
+- Model Properties and Generation Metadata
+- Model Version History and Restoration
+- Save Modified Model as a New Version
+- Model Asset Library
+- External Model Upload and Post-Processing
+- Favorites and Collected Assets
+- Gallery and Community Model Discovery
+- Asset Batch Download and Management
+- Private Model Visibility
+- Conversational AI Workflow Agent
+- Agentic Canvas Visual Node Editor
+- Reusable Multi-Step AI Workflows
+- Automatic Workflow Planning and Routing
+- Workflow Templates and Cloning
+- Control/Auto Agent Execution Modes
+- Human Review Checkpoints
+- AI 3D Lab Asset Inspection
+- AI 3D Lab Mesh and Texture Repair
+- AI 3D Lab Part Assembly
+- AI 3D Lab Interactive Game-Scene and Webpage Creation
+- Voxel Model Stylization
+- LEGO-Style Model Stylization
+- Figurine Model Stylization
+- STL Repair Tool
+- STL Mesh Editor
+- 3D Mesh Simplifier
+- 3D Model Part Splitter
+- 3D File Converter
+- 3D File Compressor
+- Online 3D File Viewer
+- Desktop 3D File Viewer
+- 3D Avatar Maker
+- 3D Text Generator
+- 3D Font Generator
+- 3D Logo Generator
+- Bambu Studio Direct Handoff
+- FBX Model Export
+- OBJ Model Export
+- GLB/glTF Model Export
+- USDZ Model Export
+- STL Model Export
+- 3MF Model Export
+- Optional Export of Textures, Rig, and Animation
+- Direct DCC/Game-Engine Bridge Plugins
+- Blender, Maya, ZBrush, 3ds Max, and Cinema 4D Handoff
+- Unity, Unreal, Godot, Roblox, and Cocos Handoff
+- ComfyUI Nodes
+- Tripo Developer API
+- Tripo Command-Line Interface
+- Project Sharing
+- Team Workspaces and Collaboration
+
+- Dedicated Printability Inspection Dashboard
+- Printer-Specific Thin-Wall Detection and Automatic Thickening
+- Automatic Print-Plate Part Arrangement
+- Reference-Image-Color-Based Print Part Splitting
+- Text-Directed Printable Part-Split Planning
+- Automatic Mortise-and-Tenon Assembly Joints
+- Adjustable Cube and Cylinder Print Connectors
+- Exploded-View Print Assembly Fit Preview
+- Textured-Model-to-Multicolor-3MF Conversion (Up to 16 Filament Colors)
+- Automatic Filament Palette Reduction and Optimization
+- Printer-Brand-Specific Multicolor Slicer Presets
+- Single-Image Low/High Bas-Relief Generator
+- Raised or Engraved Flat-Back Relief Creation
+- 16-Bit Grayscale Relief Depth-Map Export for Laser/CNC
+- AI Prompt-Guided Rendering of Multi-Object 3D Compositions
+- Standalone Text-to-Video Generation
+- Standalone Image-to-Video Generation
+- AI-Generated Video Audio
+- Scene-Render-to-Video Handoff
+- Photo-to-Mechanical-Keycap Designs with Cherry MX Base Geometry
+- AI Agent Web Reference-Image Search
+- Per-Turn Agent Credit Budget and Tool Allowlisting
+- Team-Member Credit Spending Caps
+- BLEND Native Blender-File Export
+- DXF CAD Mesh Export
+- IGES/IGS, IFC, VRM, and G-Code File Preview
+- Catalog of Ready-Made Pre-Rigged Humanoid Characters
+- Searchable Human Motion-Capture Clip Library
+- Manual Joint-Marker Placement During Automatic Humanoid Rigging
+- In-Place Option for Downloaded Motion Clips
+- Animation-Only FBX Download
+- Text-to-Navigable-3D-World Generation
+- Single-Image-to-Navigable-3D-World Generation
+- Multi-Image-to-Coherent-3D-World Generation
+- Video-to-3D-World Reconstruction
+- 360-Degree Panorama-to-3D-World Generation
+- 3D Graybox-Layout-Guided World Generation (Chisel)
+- World Structure/Visual Style Decoupling
+- Imported 3D Geometry as a World-Generation Layout Constraint
+- Persistent Free-Camera World Exploration
+- AI Editing of Complete Environment Regions
+- AI World Expansion Beyond Original Boundaries
+- AI Composition of Multiple Worlds into a Larger Space
+- 3D Gaussian-Splat World Generation and Export
+- Low-Resolution World Collider-Mesh Export
+- High-Resolution Textured Environment-Mesh Export
+- 360-Degree World Panorama Export
+- World Flythrough Video Rendering
+- AI Enhancement of World Flythrough Footage
+- Spark Browser Rendering of Gaussian-Splat Worlds
+- Streaming Level-of-Detail Gaussian-Splat Rendering
+- Atlas Viewfinder Multi-Photo Spatial Scene Reconstruction
+- Atlas Precise Camera-Pose-Conditioned Image Generation
+- Atlas Pixel-Accurate Camera-Path Video Generation
+- Atlas Spatial Interpolation Between Positioned Reference Images
+- Atlas Splats-to-Mesh Geometry Conversion
+- Atlas Gaussian-Splat Relighting
+- Atlas Chisel Live Camera-View Previews
+- Atlas Video-Based Space-Time Reconstruction and Simulation
+- Atlas Real-Time Generative World Exploration (Frameboy)
+- Atlas World-Generation/Reconstruction Developer API
