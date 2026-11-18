@@ -1,0 +1,208 @@
+"""Owner-controlled admin gateway for a *real* 3DAIGC-API GPU installation.
+
+SECURITY SCOPE: one trusted operator only. This is NOT a multi-tenant SaaS
+authentication system. Put behind a private network; never expose upstream
+anonymous mode to the internet. See docs/PHASE0_GATEWAY.md.
+"""
+
+from __future__ import annotations
+
+import hmac
+import os
+import re
+
+from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.routing import APIRoute
+from starlette.background import BackgroundTask
+from pydantic import BaseModel, ConfigDict, Field
+
+from .download import ArtifactTooLarge, fetch_verified_glb
+from .model_policy import approved_model_ids, require_model_approval
+from .upstream import UpstreamError, UpstreamGateway
+
+
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_MULTIPART_OVERHEAD_BYTES = 128 * 1024
+MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024
+JOB_ID = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+
+app = FastAPI(
+    title="Build 3D AI — Integration Gateway",
+    description="Owner-authenticated, real upstream model integration. Not yet a customer SaaS.",
+    version="0.1.0",
+)
+
+
+class ImageUploadRoute(APIRoute):
+    """Check the declared and received body size before multipart parsing."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def bounded_upload(request: Request):
+            limit = MAX_IMAGE_BYTES + MAX_MULTIPART_OVERHEAD_BYTES
+            lengths = request.headers.getlist("content-length")
+            if lengths:
+                length = lengths[0]
+                if len(lengths) != 1 or not length.isascii() or not length.isdecimal():
+                    raise HTTPException(400, "Invalid Content-Length")
+                # Avoid converting an arbitrarily long decimal header to an int.
+                digits = length.lstrip("0") or "0"
+                if len(digits) > len(str(limit)) or int(digits) > limit:
+                    raise HTTPException(413, "Multipart upload exceeds request limit")
+
+            received = 0
+
+            async def bounded_receive():
+                nonlocal received
+                message = await request.receive()
+                if message["type"] == "http.request":
+                    received += len(message.get("body", b""))
+                    if received > limit:
+                        raise HTTPException(413, "Multipart upload exceeds request limit")
+                return message
+
+            return await handler(Request(request.scope, receive=bounded_receive))
+
+        return bounded_upload
+
+
+image_uploads = APIRouter(route_class=ImageUploadRoute)
+
+
+class TextGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(min_length=1, max_length=2000)
+    model_preference: str | None = Field(default=None, max_length=128)
+
+
+def require_control_key(x_control_key: str | None = Header(default=None)) -> None:
+    expected = os.getenv("CONTROL_API_KEY", "")
+    if len(expected) < 24:
+        raise HTTPException(status_code=503, detail="Gateway key is not configured")
+    if not x_control_key or not hmac.compare_digest(x_control_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid control key")
+
+
+def get_gateway() -> UpstreamGateway:
+    return UpstreamGateway(
+        base_url=os.getenv("UPSTREAM_BASE_URL", "http://127.0.0.1:7842"),
+        bearer_token=os.getenv("UPSTREAM_BEARER_TOKEN") or None,
+    )
+
+
+def clean_job_id(job_id: str) -> str:
+    if not JOB_ID.fullmatch(job_id):
+        raise HTTPException(status_code=422, detail="Invalid job identifier")
+    return job_id
+
+
+def clean_model_id(model_preference: str | None) -> str:
+    # No implicit upstream model selection: it could activate restricted weights.
+    return require_model_approval(model_preference)
+
+
+def validate_image(data: bytes, content_type: str | None) -> None:
+    valid = (
+        (content_type == "image/png" and data.startswith(b"\x89PNG\r\n\x1a\n"))
+        or (content_type == "image/jpeg" and data.startswith(b"\xff\xd8\xff"))
+        or (
+            content_type == "image/webp"
+            and len(data) >= 12
+            and data[:4] == b"RIFF"
+            and data[8:12] == b"WEBP"
+        )
+    )
+    if not valid:
+        raise HTTPException(status_code=415, detail="Only PNG, JPEG and WEBP images allowed")
+
+
+@app.exception_handler(UpstreamError)
+async def upstream_error_handler(_, exc: UpstreamError):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
+@app.get("/health")
+async def health():
+    # Process health only; upstream/GPU status is checked via authenticated route.
+    return {"status": "ok", "service": "build3d-gateway", "gpu_verified": False}
+
+
+@app.get("/v1/upstream/status", dependencies=[Depends(require_control_key)])
+async def upstream_status(gateway: UpstreamGateway = Depends(get_gateway)):
+    return await gateway.status()
+
+
+@app.get("/v1/models", dependencies=[Depends(require_control_key)])
+async def list_models(gateway: UpstreamGateway = Depends(get_gateway)):
+    return await gateway.list_models()
+
+
+@app.get("/v1/approved-models", dependencies=[Depends(require_control_key)])
+async def approved_models():
+    return {"approved_model_ids": sorted(approved_model_ids())}
+
+
+@app.post("/v1/generations/text", dependencies=[Depends(require_control_key)])
+async def text_to_3d(
+    payload: TextGenerationRequest,
+    gateway: UpstreamGateway = Depends(get_gateway),
+):
+    return await gateway.text_to_3d(
+        prompt=payload.prompt, model_preference=clean_model_id(payload.model_preference)
+    )
+
+
+@image_uploads.post("/v1/generations/image", dependencies=[Depends(require_control_key)])
+async def image_to_3d(
+    file: UploadFile = File(...),
+    model_preference: str | None = Form(default=None),
+    gateway: UpstreamGateway = Depends(get_gateway),
+):
+    model = clean_model_id(model_preference)
+    try:
+        data = await file.read(MAX_IMAGE_BYTES + 1)
+    finally:
+        await file.close()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds 10 MiB")
+    validate_image(data, file.content_type)
+    return await gateway.image_to_3d(data, file.content_type or "", model)
+
+
+app.include_router(image_uploads)
+
+
+@app.get("/v1/jobs/{job_id}", dependencies=[Depends(require_control_key)])
+async def job_status(job_id: str, gateway: UpstreamGateway = Depends(get_gateway)):
+    return await gateway.job(clean_job_id(job_id))
+
+
+@app.get("/v1/jobs/{job_id}/download", dependencies=[Depends(require_control_key)])
+async def download(job_id: str, gateway: UpstreamGateway = Depends(get_gateway)):
+    """Return a verified, self-contained GLB or an error, never arbitrary bytes.
+
+    All upstream data is downloaded into bounded temporary storage and
+    validated BEFORE the HTTP success response starts. This gateway remains
+    owner-only and must not be publicly exposed as a multi-tenant service.
+    """
+    try:
+        path, inspection = await fetch_verified_glb(
+            gateway, clean_job_id(job_id), max_bytes=MAX_DOWNLOAD_BYTES
+        )
+    except ArtifactTooLarge as exc:
+        raise HTTPException(status_code=413, detail="Artifact exceeds 250 MiB") from exc
+
+    return FileResponse(
+        path=path,
+        filename="generated-model.glb",
+        media_type="model/gltf-binary",
+        headers={
+            "X-Artifact-SHA256": inspection.sha256,
+            "X-Artifact-Meshes": str(inspection.mesh_count),
+        },
+        background=BackgroundTask(os.unlink, path),
+    )

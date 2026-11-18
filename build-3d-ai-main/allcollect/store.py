@@ -1,0 +1,607 @@
+"""Atomic job admission, ownership, leases, and persistence.
+
+Non-idempotent upstream POSTs are never retried automatically. A lost response
+cannot prove that no GPU work was accepted. Those jobs retain their quota slot
+until an operator reconciles them with the actual upstream service.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import secrets
+import time
+import uuid
+from urllib.parse import urlsplit, urlunsplit
+
+import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
+
+from .config import Settings
+from .db import api_keys, artifacts, external_identities, jobs, projects, users
+
+
+TERMINAL = {"completed", "failed", "canceled"}
+ATTENTION = {"submission_unknown", "polling_paused", "timed_out"}
+KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+UPSTREAM_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+PUBLIC_JOB_FIELDS = (
+    "id", "project_id", "kind", "status", "model_id", "model_approval", "prompt",
+    "input_sha256", "error_code", "created_at", "updated_at", "started_at",
+)
+
+
+class StoreError(Exception):
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(detail)
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex
+
+
+def public_job(row: dict) -> dict:
+    return {key: row[key] for key in PUBLIC_JOB_FIELDS}
+
+
+def fingerprint(payload: dict) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def normalize_external_issuer(value: str) -> str:
+    """Return one canonical issuer URL or reject an ambiguous/insecure value."""
+    if not isinstance(value, str):
+        raise StoreError(422, "External identity issuer must be a URL")
+    value = value.strip()
+    if not 1 <= len(value) <= 512:
+        raise StoreError(422, "External identity issuer must contain 1–512 characters")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"https", "http"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise StoreError(422, "External identity issuer must be a clean http(s) origin/path")
+    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise StoreError(422, "External identity issuer must use HTTPS outside local development")
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+
+
+def normalize_external_subject(value: str) -> str:
+    """Treat the provider subject as opaque; never substitute email/name matching."""
+    if not isinstance(value, str) or value != value.strip() or not 1 <= len(value) <= 255:
+        raise StoreError(422, "External identity subject must contain 1–255 non-padded characters")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise StoreError(422, "External identity subject contains control characters")
+    return value
+
+
+class Store:
+    def __init__(self, engine, settings: Settings):
+        self.engine = engine
+        self.settings = settings
+
+    def create_user(self, name: str) -> dict:
+        name = name.strip()
+        if not 1 <= len(name) <= 120:
+            raise StoreError(422, "Name must contain 1–120 characters")
+        owner_id, key_id, token = new_id(), new_id(), "b3d_" + secrets.token_urlsafe(32)
+        now = time.time()
+        with self.engine.begin() as conn:
+            conn.execute(users.insert().values(
+                id=owner_id,
+                name=name,
+                active=True,
+                active_jobs=0,
+                storage_limit_bytes=self.settings.default_storage_limit_bytes,
+                created_at=now,
+            ))
+            conn.execute(api_keys.insert().values(
+                id=key_id, owner_id=owner_id, digest=hashlib.sha256(token.encode()).hexdigest(),
+                created_at=now, window_start=0, request_count=0,
+            ))
+        return {"user_id": owner_id, "key_id": key_id, "api_key": token}
+
+    def issue_key(self, owner_id: str) -> dict:
+        token, key_id = "b3d_" + secrets.token_urlsafe(32), new_id()
+        with self.engine.begin() as conn:
+            locked = conn.execute(users.update().where(
+                users.c.id == owner_id, users.c.active.is_(True),
+            ).values(active=users.c.active)).rowcount
+            if locked != 1:
+                raise StoreError(404, "Active user not found")
+            conn.execute(api_keys.insert().values(
+                id=key_id, owner_id=owner_id, digest=hashlib.sha256(token.encode()).hexdigest(),
+                created_at=time.time(), window_start=0, request_count=0,
+            ))
+        return {"user_id": owner_id, "key_id": key_id, "api_key": token}
+
+    def disable_user(self, owner_id: str) -> dict:
+        """Stop new work and release only jobs that never left the local queue."""
+        now = time.time()
+        with self.engine.begin() as conn:
+            owner = conn.execute(users.update().where(users.c.id == owner_id).values(active=False))
+            if owner.rowcount != 1:
+                raise StoreError(404, "User not found")
+            revoked = conn.execute(api_keys.update().where(
+                api_keys.c.owner_id == owner_id, api_keys.c.revoked_at.is_(None),
+            ).values(revoked_at=now)).rowcount
+            canceled = conn.execute(jobs.update().where(
+                jobs.c.owner_id == owner_id, jobs.c.status == "queued",
+            ).values(status="canceled", updated_at=now, input_image=None)).rowcount
+            if canceled:
+                conn.execute(users.update().where(
+                    users.c.id == owner_id,
+                ).values(active_jobs=users.c.active_jobs - canceled))
+            remaining = conn.scalar(sa.select(users.c.active_jobs).where(users.c.id == owner_id))
+        return {
+            "user_id": owner_id, "active": False, "revoked_keys": revoked,
+            "canceled_queued_jobs": canceled, "remaining_active_jobs": remaining,
+        }
+
+    def set_storage_quota(self, owner_id: str, limit_bytes: int) -> dict:
+        if not isinstance(limit_bytes, int) or isinstance(limit_bytes, bool):
+            raise StoreError(422, "Storage quota must be an integer number of bytes")
+        if not 0 <= limit_bytes <= 10 * 1024 * 1024 * 1024 * 1024:
+            raise StoreError(422, "Storage quota must be between 0 and 10 TiB")
+        with self.engine.begin() as conn:
+            changed = conn.execute(users.update().where(
+                users.c.id == owner_id,
+            ).values(storage_limit_bytes=limit_bytes)).rowcount
+            if changed != 1:
+                raise StoreError(404, "User not found")
+        return self.storage_usage(owner_id)
+
+    def storage_usage(self, owner_id: str) -> dict:
+        with self.engine.connect() as conn:
+            limit_bytes = conn.execute(sa.select(users.c.storage_limit_bytes).where(
+                users.c.id == owner_id,
+            )).scalar()
+            if limit_bytes is None:
+                raise StoreError(404, "User not found")
+            used_bytes = int(conn.execute(sa.select(
+                sa.func.coalesce(sa.func.sum(artifacts.c.size_bytes), 0)
+            ).where(artifacts.c.owner_id == owner_id)).scalar_one())
+        return {
+            "used_bytes": used_bytes,
+            "limit_bytes": int(limit_bytes),
+            "remaining_bytes": max(0, int(limit_bytes) - used_bytes),
+            "over_quota": used_bytes > int(limit_bytes),
+        }
+
+    def artifact_records(self, *, limit: int) -> list[dict]:
+        if not 1 <= limit <= 1_000_001:
+            raise ValueError("artifact record limit is out of range")
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(sa.select(
+                artifacts.c.id,
+                artifacts.c.job_id,
+                artifacts.c.owner_id,
+                artifacts.c.sha256,
+                artifacts.c.size_bytes,
+            ).order_by(artifacts.c.id).limit(limit)).mappings()]
+
+    def retained_job_inputs(self, owner_id: str, *, limit: int) -> list[dict]:
+        if not 1 <= limit <= 1_000_001:
+            raise ValueError("input record limit is out of range")
+        with self.engine.connect() as conn:
+            if conn.scalar(sa.select(users.c.id).where(users.c.id == owner_id)) is None:
+                raise StoreError(404, "User not found")
+            return [dict(row) for row in conn.execute(sa.select(
+                jobs.c.id.label("job_id"),
+                jobs.c.project_id,
+                jobs.c.kind,
+                jobs.c.status,
+                jobs.c.prompt.is_not(None).label("has_prompt"),
+                sa.func.length(jobs.c.input_image).label("image_bytes"),
+            ).where(
+                jobs.c.owner_id == owner_id,
+                sa.or_(jobs.c.prompt.is_not(None), jobs.c.input_image.is_not(None)),
+            ).order_by(jobs.c.id).limit(limit)).mappings()]
+
+    def revoke_key(self, key_id: str):
+        with self.engine.begin() as conn:
+            result = conn.execute(api_keys.update().where(api_keys.c.id == key_id).values(revoked_at=time.time()))
+            if result.rowcount != 1:
+                raise StoreError(404, "Key not found")
+
+    def link_external_identity(self, owner_id: str, issuer: str, subject: str) -> dict:
+        issuer = normalize_external_issuer(issuer)
+        subject = normalize_external_subject(subject)
+        now = time.time()
+        try:
+            with self.engine.begin() as conn:
+                if not conn.execute(sa.select(users.c.id).where(
+                    users.c.id == owner_id, users.c.active.is_(True),
+                )).first():
+                    raise StoreError(404, "Active user not found")
+
+                same_subject = conn.execute(sa.select(external_identities).where(
+                    external_identities.c.issuer == issuer,
+                    external_identities.c.subject == subject,
+                )).mappings().first()
+                if same_subject is not None:
+                    if same_subject["owner_id"] != owner_id:
+                        raise StoreError(409, "External identity is already linked to another user")
+                    return dict(same_subject)
+
+                same_owner_issuer = conn.execute(sa.select(external_identities).where(
+                    external_identities.c.owner_id == owner_id,
+                    external_identities.c.issuer == issuer,
+                )).mappings().first()
+                if same_owner_issuer is not None:
+                    raise StoreError(409, "User already has a different subject for this issuer")
+
+                row = {
+                    "id": new_id(),
+                    "owner_id": owner_id,
+                    "issuer": issuer,
+                    "subject": subject,
+                    "created_at": now,
+                    "window_start": 0,
+                    "request_count": 0,
+                }
+                conn.execute(external_identities.insert().values(**row))
+                return row
+        except IntegrityError as exc:
+            raise StoreError(409, "External identity link conflicts with an existing mapping") from exc
+
+    def unlink_external_identity(self, issuer: str, subject: str):
+        issuer = normalize_external_issuer(issuer)
+        subject = normalize_external_subject(subject)
+        with self.engine.begin() as conn:
+            result = conn.execute(external_identities.delete().where(
+                external_identities.c.issuer == issuer,
+                external_identities.c.subject == subject,
+            ))
+            if result.rowcount != 1:
+                raise StoreError(404, "External identity link not found")
+
+    def list_external_identities(self, owner_id: str) -> list[dict]:
+        with self.engine.connect() as conn:
+            if not conn.execute(sa.select(users.c.id).where(users.c.id == owner_id)).first():
+                raise StoreError(404, "User not found")
+            return [dict(row) for row in conn.execute(sa.select(
+                external_identities.c.id,
+                external_identities.c.issuer,
+                external_identities.c.subject,
+                external_identities.c.created_at,
+            ).where(
+                external_identities.c.owner_id == owner_id,
+            ).order_by(
+                external_identities.c.issuer,
+                external_identities.c.subject,
+            )).mappings()]
+
+    def resolve_external_identity(self, issuer: str, subject: str) -> str:
+        issuer = normalize_external_issuer(issuer)
+        subject = normalize_external_subject(subject)
+        with self.engine.connect() as conn:
+            owner_id = conn.execute(sa.select(external_identities.c.owner_id).join(
+                users, users.c.id == external_identities.c.owner_id,
+            ).where(
+                external_identities.c.issuer == issuer,
+                external_identities.c.subject == subject,
+                users.c.active.is_(True),
+            )).scalar()
+        if owner_id is None:
+            raise StoreError(401, "External identity is not linked to an active user")
+        return owner_id
+
+    def authenticate_external_identity(
+        self, issuer: str, subject: str, *, now: float | None = None
+    ) -> str:
+        issuer = normalize_external_issuer(issuer)
+        subject = normalize_external_subject(subject)
+        now = time.time() if now is None else now
+        with self.engine.begin() as conn:
+            row = conn.execute(sa.select(
+                external_identities.c.id,
+                external_identities.c.owner_id,
+            ).join(
+                users, users.c.id == external_identities.c.owner_id,
+            ).where(
+                external_identities.c.issuer == issuer,
+                external_identities.c.subject == subject,
+                users.c.active.is_(True),
+            )).mappings().first()
+            if row is None:
+                raise StoreError(401, "External identity is not linked to an active user")
+            expired = external_identities.c.window_start <= now - 60
+            result = conn.execute(external_identities.update().where(
+                external_identities.c.id == row["id"],
+                sa.or_(
+                    expired,
+                    external_identities.c.request_count < self.settings.requests_per_minute,
+                ),
+            ).values(
+                request_count=sa.case(
+                    (expired, 1),
+                    else_=external_identities.c.request_count + 1,
+                ),
+                window_start=sa.case(
+                    (expired, now),
+                    else_=external_identities.c.window_start,
+                ),
+            ))
+            if result.rowcount != 1:
+                raise StoreError(429, "API request limit reached; retry in 60 seconds")
+            return row["owner_id"]
+
+    def authenticate(self, token: str, *, now: float | None = None) -> str:
+        if not re.fullmatch(r"b3d_[A-Za-z0-9_-]{43}", token):
+            raise StoreError(401, "Invalid API key")
+        now = time.time() if now is None else now
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        with self.engine.begin() as conn:
+            row = conn.execute(sa.select(api_keys.c.id, api_keys.c.owner_id).join(users).where(
+                api_keys.c.digest == digest, api_keys.c.revoked_at.is_(None), users.c.active.is_(True),
+            )).mappings().first()
+            if row is None:
+                raise StoreError(401, "Invalid API key")
+            expired = api_keys.c.window_start <= now - 60
+            result = conn.execute(api_keys.update().where(
+                api_keys.c.id == row["id"], api_keys.c.revoked_at.is_(None),
+                sa.or_(expired, api_keys.c.request_count < self.settings.requests_per_minute),
+            ).values(
+                request_count=sa.case((expired, 1), else_=api_keys.c.request_count + 1),
+                window_start=sa.case((expired, now), else_=api_keys.c.window_start),
+            ))
+            if result.rowcount != 1:
+                raise StoreError(429, "API request limit reached; retry in 60 seconds")
+            return row["owner_id"]
+
+    def create_project(self, owner_id: str, name: str) -> dict:
+        row = {"id": new_id(), "owner_id": owner_id, "name": name, "created_at": time.time()}
+        with self.engine.begin() as conn:
+            conn.execute(projects.insert().values(**row))
+        return {key: value for key, value in row.items() if key != "owner_id"}
+
+    def list_projects(self, owner_id: str, limit: int, offset: int) -> list[dict]:
+        with self.engine.connect() as conn:
+            return [dict(r) for r in conn.execute(sa.select(
+                projects.c.id, projects.c.name, projects.c.created_at,
+            ).where(projects.c.owner_id == owner_id).order_by(
+                projects.c.created_at.desc(), projects.c.id,
+            ).limit(limit).offset(offset)).mappings()]
+
+    def project(self, owner_id: str, project_id: str) -> dict:
+        with self.engine.connect() as conn:
+            row = conn.execute(sa.select(projects).where(
+                projects.c.id == project_id, projects.c.owner_id == owner_id,
+            )).mappings().first()
+        if row is None:
+            raise StoreError(404, "Project not found")
+        return dict(row)
+
+    @staticmethod
+    def _existing(conn, owner_id: str, key: str, request_hash: str):
+        row = conn.execute(sa.select(jobs).where(
+            jobs.c.owner_id == owner_id, jobs.c.idempotency_key == key,
+        )).mappings().first()
+        if row is not None and row["request_hash"] != request_hash:
+            raise StoreError(409, "Idempotency-Key was already used for a different request")
+        return dict(row) if row else None
+
+    def submit(self, *, owner_id: str, project_id: str, kind: str, model_id: str,
+               key: str, approval: dict, prompt: str | None = None,
+               image: bytes | None = None, input_sha256: str | None = None) -> tuple[dict, bool]:
+        if not KEY_PATTERN.fullmatch(key):
+            raise StoreError(422, "Idempotency-Key must contain 1–128 letters, digits, _, ., : or -")
+        request_hash = fingerprint({
+            "project": project_id, "kind": kind, "model": model_id,
+            "prompt": prompt, "input_sha256": input_sha256,
+        })
+        now = time.time()
+        with self.engine.begin() as conn:
+            active = conn.scalar(sa.select(users.c.active).where(users.c.id == owner_id))
+            if active is not True:
+                raise StoreError(401, "User is disabled")
+            if not conn.execute(sa.select(projects.c.id).where(
+                projects.c.id == project_id, projects.c.owner_id == owner_id,
+            )).first():
+                raise StoreError(404, "Project not found")
+            existing = self._existing(conn, owner_id, key, request_hash)
+            if existing:
+                return existing, False
+            # This row update serializes admission for one owner across processes.
+            admitted = conn.execute(users.update().where(
+                users.c.id == owner_id, users.c.active.is_(True),
+                users.c.active_jobs < self.settings.max_active_jobs,
+            ).values(active_jobs=users.c.active_jobs + 1)).rowcount == 1
+            existing = self._existing(conn, owner_id, key, request_hash)
+            if existing:
+                if admitted:
+                    conn.execute(users.update().where(users.c.id == owner_id).values(active_jobs=users.c.active_jobs - 1))
+                return existing, False
+            if not admitted:
+                if conn.scalar(sa.select(users.c.active).where(users.c.id == owner_id)) is not True:
+                    raise StoreError(401, "User is disabled")
+                raise StoreError(429, "Active job limit reached; complete or cancel queued jobs first")
+            job_id = new_id()
+            conn.execute(jobs.insert().values(
+                id=job_id, owner_id=owner_id, project_id=project_id, kind=kind,
+                status="queued", idempotency_key=key, request_hash=request_hash,
+                model_id=model_id, model_approval=approval, prompt=prompt,
+                input_image=image, input_sha256=input_sha256, poll_after=now,
+                poll_failures=0, created_at=now, updated_at=now,
+            ))
+            return dict(conn.execute(sa.select(jobs).where(jobs.c.id == job_id)).mappings().one()), True
+
+    def job(self, owner_id: str, job_id: str) -> dict:
+        with self.engine.connect() as conn:
+            row = conn.execute(sa.select(jobs).where(jobs.c.id == job_id, jobs.c.owner_id == owner_id)).mappings().first()
+        if row is None:
+            raise StoreError(404, "Job not found")
+        return dict(row)
+
+    def list_jobs(self, owner_id: str, project_id: str, limit: int, offset: int) -> list[dict]:
+        self.project(owner_id, project_id)
+        with self.engine.connect() as conn:
+            # History must not hydrate up to 100 ten-megabyte input blobs.
+            columns = [jobs.c[name] for name in PUBLIC_JOB_FIELDS]
+            return [dict(row) for row in conn.execute(sa.select(*columns).where(
+                jobs.c.owner_id == owner_id, jobs.c.project_id == project_id,
+            ).order_by(jobs.c.created_at.desc(), jobs.c.id).limit(limit).offset(offset)).mappings()]
+
+    def cancel(self, owner_id: str, job_id: str) -> dict:
+        with self.engine.begin() as conn:
+            # Use the same owner-before-job lock order as account disablement.
+            conn.execute(users.update().where(
+                users.c.id == owner_id,
+            ).values(active=users.c.active))
+            changed = conn.execute(jobs.update().where(
+                jobs.c.id == job_id, jobs.c.owner_id == owner_id, jobs.c.status == "queued",
+            ).values(status="canceled", updated_at=time.time(), input_image=None)).rowcount
+            if changed:
+                conn.execute(users.update().where(users.c.id == owner_id).values(active_jobs=users.c.active_jobs - 1))
+            row = conn.execute(sa.select(jobs).where(jobs.c.id == job_id, jobs.c.owner_id == owner_id)).mappings().first()
+            if row is None:
+                raise StoreError(404, "Job not found")
+            if row["status"] != "canceled":
+                raise StoreError(409, "Only queued jobs can be canceled; upstream cancellation is not supported")
+            return dict(row)
+
+    def claim(self, *, now: float | None = None) -> dict | None:
+        now = time.time() if now is None else now
+        with self.engine.begin() as conn:
+            # A worker lost mid-POST may have created a paid job. Never resubmit it.
+            conn.execute(jobs.update().where(
+                jobs.c.status == "dispatching", jobs.c.lease_until <= now,
+            ).values(status="submission_unknown", error_code="submission_outcome_unknown",
+                     updated_at=now, lease_token=None, lease_until=None))
+            available = sa.and_(
+                sa.or_(
+                    jobs.c.status == "running",
+                    sa.and_(
+                        jobs.c.status == "queued",
+                        sa.exists(sa.select(users.c.id).where(
+                            users.c.id == jobs.c.owner_id, users.c.active.is_(True),
+                        )),
+                    ),
+                ),
+                jobs.c.poll_after <= now,
+                sa.or_(jobs.c.lease_until.is_(None), jobs.c.lease_until <= now),
+            )
+            candidates = conn.execute(sa.select(jobs.c.id).where(available).order_by(
+                sa.case((jobs.c.status == "running", 0), else_=1), jobs.c.created_at,
+            ).limit(16)).scalars().all()
+            for job_id in candidates:
+                token = new_id()
+                changed = conn.execute(jobs.update().where(jobs.c.id == job_id, available).values(
+                    status=sa.case((jobs.c.status == "queued", "dispatching"), else_=jobs.c.status),
+                    started_at=sa.func.coalesce(jobs.c.started_at, now),
+                    lease_token=token, lease_until=now + self.settings.lease_seconds, updated_at=now,
+                )).rowcount
+                if changed:
+                    return dict(conn.execute(sa.select(jobs).where(jobs.c.id == job_id)).mappings().one())
+        return None
+
+    def transition(self, job: dict, status: str, *, now: float | None = None,
+                   artifact: dict | None = None, **values) -> bool:
+        now = time.time() if now is None else now
+        lease_filter = sa.and_(
+            jobs.c.id == job["id"],
+            jobs.c.status == job["status"],
+            jobs.c.lease_token == job["lease_token"],
+            jobs.c.lease_until > now,
+        )
+        with self.engine.begin() as conn:
+            if artifact is not None:
+                if (
+                    status != "completed"
+                    or artifact.get("job_id") != job["id"]
+                    or artifact.get("owner_id") != job["owner_id"]
+                    or not isinstance(artifact.get("size_bytes"), int)
+                    or isinstance(artifact.get("size_bytes"), bool)
+                    or artifact["size_bytes"] <= 0
+                ):
+                    raise ValueError("Invalid artifact transition metadata")
+
+                # Serialize artifact completion per owner. PostgreSQL obtains a
+                # row lock; SQLite obtains its write lock through this no-op
+                # UPDATE before the SUM, preventing concurrent quota overrun.
+                locked = conn.execute(users.update().where(
+                    users.c.id == job["owner_id"],
+                ).values(storage_limit_bytes=users.c.storage_limit_bytes)).rowcount
+                if locked != 1:
+                    return False
+                limit_bytes = int(conn.execute(sa.select(users.c.storage_limit_bytes).where(
+                    users.c.id == job["owner_id"],
+                )).scalar_one())
+                used_bytes = int(conn.execute(sa.select(
+                    sa.func.coalesce(sa.func.sum(artifacts.c.size_bytes), 0)
+                ).where(artifacts.c.owner_id == job["owner_id"])).scalar_one())
+
+                if used_bytes + artifact["size_bytes"] > limit_bytes:
+                    changed = conn.execute(jobs.update().where(lease_filter).values(
+                        status="failed",
+                        lease_token=None,
+                        lease_until=None,
+                        updated_at=now,
+                        input_image=None,
+                        error_code="artifact_storage_quota_exceeded",
+                    )).rowcount
+                    if changed:
+                        conn.execute(users.update().where(
+                            users.c.id == job["owner_id"],
+                        ).values(active_jobs=users.c.active_jobs - 1))
+                    # False tells the worker not to retain the already-published
+                    # object. A lost DB commit acknowledgement can still leave a
+                    # private orphan, which the maintenance scanner reports.
+                    return False
+
+            changed = conn.execute(jobs.update().where(lease_filter).values(
+                status=status, lease_token=None, lease_until=None, updated_at=now,
+                **({"input_image": None} if status in TERMINAL else {}), **values,
+            )).rowcount
+            if not changed:
+                return False
+            if artifact is not None:
+                conn.execute(artifacts.insert().values(**artifact))
+            if status in TERMINAL:
+                conn.execute(users.update().where(
+                    users.c.id == job["owner_id"],
+                ).values(active_jobs=users.c.active_jobs - 1))
+            return True
+
+    def artifact(self, owner_id: str, job_id: str) -> dict:
+        self.job(owner_id, job_id)
+        with self.engine.connect() as conn:
+            row = conn.execute(sa.select(artifacts).where(
+                artifacts.c.owner_id == owner_id, artifacts.c.job_id == job_id,
+            )).mappings().first()
+        if row is None:
+            raise StoreError(409, "No verified artifact is available for this job")
+        return dict(row)
+
+    def reconcile(self, job_id: str, upstream_id: str | None, *, confirm_stopped: bool = False):
+        if upstream_id is not None and not UPSTREAM_ID.fullmatch(upstream_id):
+            raise StoreError(422, "Invalid upstream job ID")
+        if upstream_id is None and not confirm_stopped:
+            raise StoreError(409, "Confirm the upstream is stopped before releasing a job slot")
+        now = time.time()
+        with self.engine.begin() as conn:
+            row = conn.execute(sa.select(jobs).where(jobs.c.id == job_id)).mappings().first()
+            if row is None:
+                raise StoreError(404, "Job not found")
+            if row["status"] not in ATTENTION:
+                raise StoreError(409, "Only jobs requiring operator attention can be reconciled")
+            changed = conn.execute(jobs.update().where(
+                jobs.c.id == job_id, jobs.c.status == row["status"],
+            ).values(
+                status="running" if upstream_id else "failed",
+                upstream_job_id=upstream_id or row["upstream_job_id"], error_code=None if upstream_id else "operator_resolved",
+                poll_after=now, poll_failures=0, started_at=now, updated_at=now,
+                input_image=None, lease_token=None, lease_until=None,
+            )).rowcount
+            if changed != 1:
+                raise StoreError(409, "Job changed; reload before reconciling")
+            if upstream_id is None:
+                conn.execute(users.update().where(users.c.id == row["owner_id"]).values(active_jobs=users.c.active_jobs - 1))
